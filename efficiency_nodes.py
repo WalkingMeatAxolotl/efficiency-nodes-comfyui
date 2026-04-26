@@ -197,9 +197,11 @@ class TSC_EfficientLoader:
             vae = load_vae(vae_name, my_unique_id, cache=vae_cache, cache_overwrite=True)
 
         # Data for XY Plot
+        # NOTE: a 17th field 'advanced_extras' (None here) is appended so the unpacker can
+        # distinguish ckpt-mode from the new TSC_EfficientLoaderAdvanced output.
         dependencies = (vae_name, ckpt_name, clip, clip_skip, refiner_name, refiner_clip, refiner_clip_skip,
                         positive, negative, token_normalization, weight_interpretation, ascore,
-                        empty_latent_width, empty_latent_height, lora_params, cnet_stack)
+                        empty_latent_width, empty_latent_height, lora_params, cnet_stack, None)
 
         ### Debugging
         ###print_loaded_objects_entries()
@@ -210,6 +212,109 @@ class TSC_EfficientLoader:
         elif loader_type == "sdxl":
             return ((model, clip, positive_encoded, negative_encoded, refiner_model, refiner_clip,
                      refiner_positive_encoded, refiner_negative_encoded), {"samples":latent}, vae, dependencies,)
+
+#=======================================================================================================================
+# TSC Efficient Loader Advanced (UNET + CLIP + VAE split, mirrors ComfyUI's UNETLoader / CLIPLoader / VAELoader)
+class TSC_EfficientLoaderAdvanced:
+
+    CLIP_TYPES = ["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart",
+                  "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image",
+                  "hunyuan_image", "flux2", "ovis", "longcat_image"]
+    WEIGHT_DTYPES = ["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": { "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                              "weight_dtype": (cls.WEIGHT_DTYPES,),
+                              "vae_name": (folder_paths.get_filename_list("vae"),),
+                              "clip_name": (folder_paths.get_filename_list("text_encoders"),),
+                              "clip_type": (cls.CLIP_TYPES,),
+                              "clip_skip": ("INT", {"default": -1, "min": -24, "max": -1, "step": 1}),
+                              "lora_name": (["None"] + folder_paths.get_filename_list("loras"),),
+                              "lora_model_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                              "lora_clip_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                              "positive": ("STRING", {"default": "CLIP_POSITIVE","multiline": True}),
+                              "negative": ("STRING", {"default": "CLIP_NEGATIVE", "multiline": True}),
+                              "token_normalization": (["none", "mean", "length", "length+mean"],),
+                              "weight_interpretation": (["comfy", "A1111", "compel", "comfy++", "down_weight"],),
+                              "empty_latent_width": ("INT", {"default": 1024, "min": 64, "max": MAX_RESOLUTION, "step": 64}),
+                              "empty_latent_height": ("INT", {"default": 1024, "min": 64, "max": MAX_RESOLUTION, "step": 64}),
+                              "batch_size": ("INT", {"default": 1, "min": 1, "max": 262144})},
+                "optional": {"lora_stack": ("LORA_STACK", ),
+                             "cnet_stack": ("CONTROL_NET_STACK",)},
+                "hidden": { "prompt": "PROMPT",
+                            "my_unique_id": "UNIQUE_ID",},
+                }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "VAE", "CLIP", "DEPENDENCIES",)
+    RETURN_NAMES = ("MODEL", "CONDITIONING+", "CONDITIONING-", "LATENT", "VAE", "CLIP", "DEPENDENCIES", )
+    FUNCTION = "efficientloader_advanced"
+    CATEGORY = "Efficiency Nodes/Loaders"
+
+    def efficientloader_advanced(self, unet_name, weight_dtype, vae_name, clip_name, clip_type, clip_skip,
+                                 lora_name, lora_model_strength, lora_clip_strength, positive, negative,
+                                 token_normalization, weight_interpretation, empty_latent_width,
+                                 empty_latent_height, batch_size, lora_stack=None, cnet_stack=None,
+                                 prompt=None, my_unique_id=None):
+
+        globals_cleanup(prompt)
+
+        # Empty latent — fix_empty_latent_channels in the sampler will reshape to 5D for 3D-latent models.
+        latent = torch.zeros([batch_size, 4, empty_latent_height // 8, empty_latent_width // 8]).cpu()
+
+        vae_cache, ckpt_cache, lora_cache, refn_cache = get_cache_numbers("Efficient Loader")
+
+        # Build the LoRA stack (single LoRA + optional stack)
+        lora_params = []
+        if lora_name != "None":
+            lora_params.append((lora_name, lora_model_strength, lora_clip_strength))
+        if lora_stack:
+            lora_params.extend(lora_stack)
+
+        if lora_params:
+            model, clip = load_lora_advanced(lora_params, unet_name, weight_dtype, clip_name, clip_type,
+                                             my_unique_id, cache=lora_cache,
+                                             unet_cache=ckpt_cache, clip_cache=ckpt_cache,
+                                             cache_overwrite=True)
+        else:
+            model = load_unet_advanced(unet_name, weight_dtype, my_unique_id, cache=ckpt_cache, cache_overwrite=True)
+            clip = load_clip_advanced(clip_name, clip_type, my_unique_id, cache=ckpt_cache, cache_overwrite=True)
+            lora_params = None
+
+        vae = load_vae(vae_name, my_unique_id, cache=vae_cache, cache_overwrite=True)
+
+        # Encode prompt with the (possibly LoRA-patched) clip.
+        # Use ComfyUI's native CLIPTextEncode rather than encode_prompts/bnk_adv_encode — the latter is
+        # hard-coded to access tokenized['l'] (SD/SDXL CLIP-L) and KeyErrors on Qwen / T5 / Llama / Gemma
+        # tokenizers used by Qwen-Image / Flux / SD3 / HiDream / etc.
+        # CLIPSetLastLayer is also skipped: clip_skip is a CLIP-ViT concept and is a no-op (or noisy) for
+        # decoder-only LLM text encoders. Users wanting a SDXL-style skip should use the original loader.
+        positive_encoded = CLIPTextEncode().encode(clip, positive)[0]
+        negative_encoded = CLIPTextEncode().encode(clip, negative)[0]
+
+        if cnet_stack:
+            controlnet_conditioning = TSC_Apply_ControlNet_Stack().apply_cnet_stack(positive_encoded, negative_encoded, cnet_stack)
+            positive_encoded, negative_encoded = controlnet_conditioning[0], controlnet_conditioning[1]
+
+        # Pack advanced loader specifics so XY Plot's define_model can rebuild model/clip per-cell.
+        # ckpt_name slot is set to a sentinel so any accidental ckpt-mode codepath fails loudly
+        # rather than silently loading a stale checkpoint.
+        advanced_extras = {
+            "loader_mode": "advanced",
+            "unet_name": unet_name,
+            "weight_dtype": weight_dtype,
+            "clip_name": clip_name,
+            "clip_type": clip_type,
+        }
+        ckpt_name_sentinel = "__ADVANCED__:" + unet_name
+
+        dependencies = (vae_name, ckpt_name_sentinel, clip, clip_skip, "None", None, None,
+                        positive, negative, token_normalization, weight_interpretation, None,
+                        empty_latent_width, empty_latent_height, lora_params, cnet_stack, advanced_extras)
+
+        print_loaded_objects_entries(my_unique_id, prompt)
+
+        return (model, positive_encoded, negative_encoded, {"samples": latent}, vae, clip, dependencies,)
 
 #=======================================================================================================================
 # TSC Efficient Loader SDXL
@@ -464,6 +569,14 @@ class TSC_KSampler:
 
         #---------------------------------------------------------------------------------------------------------------
         def vae_decode_latent(vae, samples, vae_decode):
+            # Only the VAE's own latent_dim decides whether we need video-style tiled decoding.
+            # samples["samples"].ndim==5 alone does NOT imply a 3D-latent VAE: a 3D-latent UNET
+            # (e.g. Anima with Wan21 latent format) can be paired with a 2D-latent image VAE,
+            # in which case ComfyUI's native VAEDecode squeezes the time dim itself
+            # (sd.py: `if self.latent_dim == 2 and samples_in.ndim == 5: samples_in = samples_in[:, :, 0]`).
+            # Forcing a tiled-temporal decode on a 2D VAE here produces garbage output.
+            if getattr(vae, "latent_dim", 2) == 3:
+                return VAEDecodeTiled().decode(vae, samples, 512, overlap=64, temporal_size=64, temporal_overlap=8)[0]
             return VAEDecodeTiled().decode(vae,samples,320)[0] if "tiled" in vae_decode else VAEDecode().decode(vae,samples)[0]
 
         def vae_encode_image(vae, pixels, vae_decode):
@@ -859,11 +972,18 @@ class TSC_KSampler:
                     "result": (model, positive, negative, latent_image, vae, TSC_KSampler.empty_image,)}
 
             #_______________________________________________________________________________________________________
-            # Unpack Effficient Loader dependencies
+            # Unpack Effficient Loader dependencies (advanced_extras is the 17th field — None for ckpt-mode loaders)
+            advanced_extras = None
             if dependencies is not None:
-                vae_name, ckpt_name, clip, clip_skip, refiner_name, refiner_clip, refiner_clip_skip,\
-                    positive_prompt, negative_prompt, token_normalization, weight_interpretation, ascore,\
-                    empty_latent_width, empty_latent_height, lora_stack, cnet_stack = dependencies
+                if len(dependencies) == 17:
+                    vae_name, ckpt_name, clip, clip_skip, refiner_name, refiner_clip, refiner_clip_skip,\
+                        positive_prompt, negative_prompt, token_normalization, weight_interpretation, ascore,\
+                        empty_latent_width, empty_latent_height, lora_stack, cnet_stack, advanced_extras = dependencies
+                else:
+                    # Backwards compat with any third-party loader that hasn't been updated to the 17-field tuple
+                    vae_name, ckpt_name, clip, clip_skip, refiner_name, refiner_clip, refiner_clip_skip,\
+                        positive_prompt, negative_prompt, token_normalization, weight_interpretation, ascore,\
+                        empty_latent_width, empty_latent_height, lora_stack, cnet_stack = dependencies
 
             #_______________________________________________________________________________________________________
             # Printout XY Plot values to be processed
@@ -1395,18 +1515,36 @@ class TSC_KSampler:
                                                 cache=None, ckpt_cache=cache[1])
                     encode = True
 
-                # Load LoRA if required
+                # Load LoRA if required.
+                # When dependencies came from TSC_EfficientLoaderAdvanced (advanced_extras is set),
+                # rebuild model/clip from the advanced (UNET + CLIP) base instead of reloading a checkpoint.
                 elif (X_type in ("LoRA", "LoRA Stacks")):
-                    # Don't cache Checkpoints
-                    model, clip = load_lora(lora_stack, ckpt_name, xyplot_id, cache=cache[2])
+                    if advanced_extras is not None:
+                        model, clip = load_lora_advanced(
+                            lora_stack, advanced_extras["unet_name"], advanced_extras["weight_dtype"],
+                            advanced_extras["clip_name"], advanced_extras["clip_type"],
+                            xyplot_id, cache=cache[2], unet_cache=cache[1], clip_cache=cache[1])
+                    else:
+                        model, clip = load_lora(lora_stack, ckpt_name, xyplot_id, cache=cache[2])
                     encode = True
-                elif Y_type in ("LoRA", "LoRA Stacks"):  # X_type must be Checkpoint, so cache those as defined
-                    model, clip = load_lora(lora_stack, ckpt_name, xyplot_id,
-                                            cache=None, ckpt_cache=cache[1])
+                elif Y_type in ("LoRA", "LoRA Stacks"):
+                    if advanced_extras is not None:
+                        model, clip = load_lora_advanced(
+                            lora_stack, advanced_extras["unet_name"], advanced_extras["weight_dtype"],
+                            advanced_extras["clip_name"], advanced_extras["clip_type"],
+                            xyplot_id, cache=None, unet_cache=cache[1], clip_cache=cache[1])
+                    else:
+                        model, clip = load_lora(lora_stack, ckpt_name, xyplot_id,
+                                                cache=None, ckpt_cache=cache[1])
                     encode = True
                 elif X_type == "LoRA Batch" or X_type == "LoRA Wt" or X_type == "LoRA MStr" or X_type == "LoRA CStr":
-                    # Don't cache Checkpoints or LoRAs
-                    model, clip = load_lora(lora_stack, ckpt_name, xyplot_id, cache=0)
+                    if advanced_extras is not None:
+                        model, clip = load_lora_advanced(
+                            lora_stack, advanced_extras["unet_name"], advanced_extras["weight_dtype"],
+                            advanced_extras["clip_name"], advanced_extras["clip_type"],
+                            xyplot_id, cache=0, unet_cache=cache[1], clip_cache=cache[1])
+                    else:
+                        model, clip = load_lora(lora_stack, ckpt_name, xyplot_id, cache=0)
                     encode = True
 
                 if (X_type == "Refiner" and index == 0) or Y_type == "Refiner":
@@ -1426,8 +1564,17 @@ class TSC_KSampler:
                 if (X_type in encode_refiner_types and index == 0) or Y_type in encode_refiner_types:
                     encode_refiner = True
 
-                # Encode base prompt
-                if encode == True:
+                # Encode base prompt.
+                # Advanced loader path: NEVER re-encode here — keep the conditioning produced by the Loader
+                # (or by the user's CLIP text encode nodes) intact and pass it straight through. Reasons:
+                #   1) Anima/Flux/SD3/HiDream etc. carry extras (t5xxl_ids, t5xxl_weights, attention_mask,
+                #      pooled_output, ...) that must reach model.extra_conds(). Re-tokenizing/encoding here
+                #      is fragile and was producing broken output.
+                #   2) LoRA's clip-side patches (lora_clip_strength) won't reflect, but model-side patches
+                #      (lora_model_strength) — which dominate visual diff in LoRA XY tests — work fine.
+                # If a user genuinely needs prompt re-encoding per cell (e.g. Prompt S/R), use the original
+                # ckpt-mode Efficient Loader instead.
+                if encode == True and advanced_extras is None:
                     positive, negative, clip = \
                         encode_prompts(positive_prompt, negative_prompt, token_normalization, weight_interpretation,
                                        clip, clip_skip, refiner_clip, refiner_clip_skip, ascore, sampler_type == "sdxl",
@@ -4266,6 +4413,7 @@ NODE_CLASS_MAPPINGS = {
     "KSampler Adv. (Efficient)":TSC_KSamplerAdvanced,
     "KSampler SDXL (Eff.)": TSC_KSamplerSDXL,
     "Efficient Loader": TSC_EfficientLoader,
+    "Efficient Loader Advanced": TSC_EfficientLoaderAdvanced,
     "Eff. Loader SDXL": TSC_EfficientLoaderSDXL,
     "LoRA Stacker": TSC_LoRA_Stacker,
     "Control Net Stacker": TSC_Control_Net_Stacker,

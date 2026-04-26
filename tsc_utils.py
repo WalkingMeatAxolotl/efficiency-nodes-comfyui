@@ -33,7 +33,10 @@ loaded_objects = {
     "ckpt": [], # (ckpt_name, ckpt_model, clip, bvae, [id])
     "refn": [], # (ckpt_name, ckpt_model, clip, bvae, [id])
     "vae": [],  # (vae_name, vae, [id])
-    "lora": []  # ([(lora_name, strength_model, strength_clip)], ckpt_name, lora_model, clip_lora, [id])
+    "lora": [],  # ([(lora_name, strength_model, strength_clip)], ckpt_name, lora_model, clip_lora, [id])
+    "unet": [], # ((unet_name, weight_dtype), unet_model, [id])           # Advanced loader UNETs
+    "clip_te": [], # ((clip_name, clip_type), clip, [id])                  # Advanced loader CLIPs
+    "lora_adv": [] # ([loras], (unet_name, weight_dtype, clip_name, clip_type), model, clip, [id])
 }
 
 # Cache for Efficient Ksamplers
@@ -295,8 +298,10 @@ def load_vae(vae_name, id, cache=None, cache_overwrite=False):
     else:
         vae_path = folder_paths.get_full_path("vae", vae_name)
 
-    sd = comfy.utils.load_torch_file(vae_path)
-    vae = comfy.sd.VAE(sd=sd)
+    # Mirror native VAELoader: pass metadata so VAEs that ship a 'config' in metadata
+    # (e.g. quantized / packaged VAEs) get the right dim / channels.
+    sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+    vae = comfy.sd.VAE(sd=sd, metadata=metadata)
 
     if cache:
         if len([entry for entry in loaded_objects["vae"] if id in entry[-1]]) < cache:
@@ -397,6 +402,142 @@ def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_ove
                 loaded_objects["lora"].append((lora_params, ckpt_name, lora_model, lora_clip, [id]))
 
     return lora_model, lora_clip
+
+# ----- Advanced loader (UNET + CLIP + VAE split, mirrors ComfyUI's UNETLoader / CLIPLoader / VAELoader) -----
+
+def _weight_dtype_to_model_options(weight_dtype):
+    import torch as _torch
+    model_options = {}
+    if weight_dtype == "fp8_e4m3fn":
+        model_options["dtype"] = _torch.float8_e4m3fn
+    elif weight_dtype == "fp8_e4m3fn_fast":
+        model_options["dtype"] = _torch.float8_e4m3fn
+        model_options["fp8_optimizations"] = True
+    elif weight_dtype == "fp8_e5m2":
+        model_options["dtype"] = _torch.float8_e5m2
+    return model_options
+
+def _resolve_clip_type(clip_type_name):
+    return getattr(comfy.sd.CLIPType, clip_type_name.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+def load_unet_advanced(unet_name, weight_dtype, id, cache=None, cache_overwrite=True):
+    """Load a diffusion UNET (from diffusion_models folder) with caching keyed on (unet_name, weight_dtype)."""
+    global loaded_objects
+    key = (unet_name, weight_dtype)
+    for entry in loaded_objects["unet"]:
+        if entry[0] == key:
+            _, model, ids = entry
+            if cache and len([e for e in loaded_objects["unet"] if id in e[-1]]) >= cache:
+                clear_cache(id, cache, "unet")
+            elif id not in ids:
+                ids.append(id)
+            return model
+
+    unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
+    if unet_path is None:
+        unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+    with suppress_output():
+        model = comfy.sd.load_diffusion_model(unet_path, model_options=_weight_dtype_to_model_options(weight_dtype))
+
+    if cache:
+        if len([e for e in loaded_objects["unet"] if id in e[-1]]) < cache:
+            loaded_objects["unet"].append((key, model, [id]))
+        else:
+            clear_cache(id, cache, "unet")
+            if cache_overwrite:
+                for e in loaded_objects["unet"]:
+                    if id in e[-1]:
+                        e[-1].remove(id)
+                        if not e[-1]:
+                            loaded_objects["unet"].remove(e)
+                        break
+                loaded_objects["unet"].append((key, model, [id]))
+    return model
+
+def load_clip_advanced(clip_name, clip_type_name, id, cache=None, cache_overwrite=True):
+    """Load a single text-encoder (from text_encoders folder), keyed on (clip_name, clip_type_name)."""
+    global loaded_objects
+    key = (clip_name, clip_type_name)
+    for entry in loaded_objects["clip_te"]:
+        if entry[0] == key:
+            _, clip, ids = entry
+            if cache and len([e for e in loaded_objects["clip_te"] if id in e[-1]]) >= cache:
+                clear_cache(id, cache, "clip_te")
+            elif id not in ids:
+                ids.append(id)
+            return clip
+
+    clip_path = folder_paths.get_full_path("text_encoders", clip_name)
+    if clip_path is None:
+        clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
+    with suppress_output():
+        clip = comfy.sd.load_clip(
+            ckpt_paths=[clip_path],
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            clip_type=_resolve_clip_type(clip_type_name),
+        )
+
+    if cache:
+        if len([e for e in loaded_objects["clip_te"] if id in e[-1]]) < cache:
+            loaded_objects["clip_te"].append((key, clip, [id]))
+        else:
+            clear_cache(id, cache, "clip_te")
+            if cache_overwrite:
+                for e in loaded_objects["clip_te"]:
+                    if id in e[-1]:
+                        e[-1].remove(id)
+                        if not e[-1]:
+                            loaded_objects["clip_te"].remove(e)
+                        break
+                loaded_objects["clip_te"].append((key, clip, [id]))
+    return clip
+
+def load_lora_advanced(lora_params, unet_name, weight_dtype, clip_name, clip_type_name,
+                       id, cache=None, unet_cache=None, clip_cache=None, cache_overwrite=False):
+    """Apply a LoRA stack onto an advanced (UNET+CLIP) base, with full caching parity with load_lora."""
+    global loaded_objects
+    base_key = (unet_name, weight_dtype, clip_name, clip_type_name)
+
+    for entry in loaded_objects["lora_adv"]:
+        if set(entry[0]) == set(lora_params) and entry[1] == base_key:
+            _, _, lora_model, lora_clip, ids = entry
+            if cache and len([e for e in loaded_objects["lora_adv"] if id in e[-1]]) >= cache:
+                clear_cache(id, cache, "lora_adv")
+            elif id not in ids:
+                ids.append(id)
+            return lora_model, lora_clip
+
+    base_unet = load_unet_advanced(unet_name, weight_dtype, id, cache=unet_cache)
+    base_clip = load_clip_advanced(clip_name, clip_type_name, id, cache=clip_cache)
+
+    out_model, out_clip = base_unet, base_clip
+    for lora_name, strength_model, strength_clip in lora_params:
+        if lora_name in (None, "None", ""):
+            continue
+        lora_path = lora_name if os.path.isabs(lora_name) else folder_paths.get_full_path("loras", lora_name)
+        try:
+            lora_sd = comfy.utils.load_torch_file(lora_path)
+            out_model, out_clip = comfy.sd.load_lora_for_models(
+                out_model, out_clip, lora_sd, strength_model, strength_clip
+            )
+        except Exception as e:
+            raise ValueError("Error loading Lora file: {} \n{}".format(lora_name, e))
+
+    if cache:
+        if len([e for e in loaded_objects["lora_adv"] if id in e[-1]]) < cache:
+            loaded_objects["lora_adv"].append((lora_params, base_key, out_model, out_clip, [id]))
+        else:
+            clear_cache(id, cache, "lora_adv")
+            if cache_overwrite:
+                for e in loaded_objects["lora_adv"]:
+                    if id in e[-1]:
+                        e[-1].remove(id)
+                        if not e[-1]:
+                            loaded_objects["lora_adv"].remove(e)
+                        break
+                loaded_objects["lora_adv"].append((lora_params, base_key, out_model, out_clip, [id]))
+
+    return out_model, out_clip
 
 def clear_cache(id, cache, dict_name):
     """
